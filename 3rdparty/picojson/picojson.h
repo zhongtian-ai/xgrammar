@@ -50,6 +50,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -172,6 +174,9 @@ class value {
  protected:
   int type_;
   _storage u_;
+  // Preserve a parsed JSON number's decimal spelling alongside its convenience
+  // numeric representation. Schema compilers require exact decimal arithmetic.
+  std::string number_lexeme_;
 
  public:
   value();
@@ -199,6 +204,8 @@ class value {
   value& operator=(value&& x) PICOJSON_NOEXCEPT;
 #endif
   void swap(value& x) PICOJSON_NOEXCEPT;
+  const std::string& number_lexeme() const { return number_lexeme_; }
+  void set_number_lexeme(const std::string& text) { number_lexeme_ = text; }
   template <typename T>
   bool is() const;
   template <typename T>
@@ -405,6 +412,7 @@ inline value::value(const char* s, size_t len) : type_(string_type), u_() {
 }
 
 inline void value::clear() {
+  number_lexeme_.clear();
   switch (type_) {
 #define DEINIT(p) \
   case p##type:   \
@@ -421,7 +429,7 @@ inline void value::clear() {
 
 inline value::~value() { clear(); }
 
-inline value::value(const value& x) : type_(x.type_), u_() {
+inline value::value(const value& x) : type_(x.type_), u_(), number_lexeme_(x.number_lexeme_) {
   switch (type_) {
 #define INIT(p, v) \
   case p##type:    \
@@ -455,6 +463,7 @@ inline value& value::operator=(value&& x) PICOJSON_NOEXCEPT {
 inline void value::swap(value& x) PICOJSON_NOEXCEPT {
   std::swap(type_, x.type_);
   std::swap(u_, x.u_);
+  number_lexeme_.swap(x.number_lexeme_);
 }
 
 #define IS(ctype, jtype)                 \
@@ -490,6 +499,7 @@ inline bool value::is<double>() const {
   template <>                                                                            \
   inline ctype& value::get<ctype>() {                                                    \
     PICOJSON_ASSERT("type mismatch! call is<type>() before get<type>()" && is<ctype>()); \
+    number_lexeme_.clear();                                                               \
     return var;                                                                          \
   }
 GET(bool, u_.boolean_)
@@ -704,6 +714,10 @@ void value::_indent(Iter oi, int indent) {
 
 template <typename Iter>
 void value::_serialize(Iter oi, int indent) const {
+  if (!number_lexeme_.empty()) {
+    std::copy(number_lexeme_.begin(), number_lexeme_.end(), oi);
+    return;
+  }
   switch (type_) {
     case string_type:
       serialize_str(*u_.string_, oi);
@@ -1013,17 +1027,38 @@ inline std::string _parse_number(input<Iter>& in) {
     if (('0' <= ch && ch <= '9') || ch == '+' || ch == '-' || ch == 'e' || ch == 'E') {
       num_str.push_back(static_cast<char>(ch));
     } else if (ch == '.') {
-#if PICOJSON_USE_LOCALE
-      num_str += localeconv()->decimal_point;
-#else
       num_str.push_back('.');
-#endif
     } else {
       in.ungetc();
       break;
     }
   }
   return num_str;
+}
+
+inline bool _valid_number_lexeme(const std::string& text) {
+  size_t i = 0;
+  if (i < text.size() && text[i] == '-') ++i;
+  if (i == text.size()) return false;
+  if (text[i] == '0') {
+    ++i;
+  } else {
+    if (text[i] < '1' || text[i] > '9') return false;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+  }
+  if (i < text.size() && text[i] == '.') {
+    const size_t start = ++i;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+    if (i == start) return false;
+  }
+  if (i < text.size() && (text[i] == 'e' || text[i] == 'E')) {
+    ++i;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-')) ++i;
+    const size_t start = i;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+    if (i == start) return false;
+  }
+  return i == text.size();
 }
 
 template <typename Context, typename Iter>
@@ -1055,7 +1090,7 @@ inline bool _parse(Context& ctx, input<Iter>& in) {
         char* endp;
         in.ungetc();
         std::string num_str(_parse_number(in));
-        if (num_str.empty()) {
+        if (!_valid_number_lexeme(num_str)) {
           return false;
         }
 #ifdef PICOJSON_USE_INT64
@@ -1065,17 +1100,27 @@ inline bool _parse(Context& ctx, input<Iter>& in) {
           if (errno == 0 && std::numeric_limits<int64_t>::min() <= ival &&
               ival <= std::numeric_limits<int64_t>::max() &&
               endp == num_str.c_str() + num_str.size()) {
-            ctx.set_int64(ival);
+            if (!ctx.set_int64(ival)) return false;
+            ctx.set_number_lexeme(num_str);
             return true;
           }
         }
 #endif
-        f = strtod(num_str.c_str(), &endp);
-        if (endp == num_str.c_str() + num_str.size()) {
-          ctx.set_number(f);
-          return true;
+        // The decimal spelling is authoritative. This local classic-locale
+        // conversion supplies the existing approximate numeric accessor without
+        // consulting mutable process locale or rejecting finite JSON decimals
+        // beyond the binary floating-point range.
+        f = 0;
+        std::istringstream conversion(num_str);
+        conversion.imbue(std::locale::classic());
+        conversion >> f;
+        if (!std::isfinite(f)) {
+          f = num_str[0] == '-' ? -std::numeric_limits<double>::max()
+                                : std::numeric_limits<double>::max();
         }
-        return false;
+        if (!ctx.set_number(f)) return false;
+        ctx.set_number_lexeme(num_str);
+        return true;
       }
       break;
   }
@@ -1091,6 +1136,7 @@ class deny_parse_context {
   bool set_int64(int64_t) { return false; }
 #endif
   bool set_number(double) { return false; }
+  void set_number_lexeme(const std::string&) {}
   template <typename Iter>
   bool parse_string(input<Iter>&) {
     return false;
@@ -1133,6 +1179,7 @@ class default_parse_context {
     *out_ = value(f);
     return true;
   }
+  void set_number_lexeme(const std::string& text) { out_->set_number_lexeme(text); }
   template <typename Iter>
   // NOLINTNEXTLINE(runtime/references)
   bool parse_string(input<Iter>& in) {
@@ -1183,6 +1230,7 @@ class null_parse_context {
   bool set_int64(int64_t) { return true; }
 #endif
   bool set_number(double) { return true; }
+  void set_number_lexeme(const std::string&) {}
   template <typename Iter>
   // NOLINTNEXTLINE(runtime/references)
   bool parse_string(input<Iter>& in) {

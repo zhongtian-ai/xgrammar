@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -45,17 +47,15 @@ std::string IntegerSpec::ToString() const {
          ", exclusive_minimum=" +
          (exclusive_minimum.has_value() ? std::to_string(*exclusive_minimum) : "null") +
          ", exclusive_maximum=" +
-         (exclusive_maximum.has_value() ? std::to_string(*exclusive_maximum) : "null") +
-         ", multiple_of=" + (multiple_of.has_value() ? std::to_string(*multiple_of) : "null") + "}";
+         (exclusive_maximum.has_value() ? std::to_string(*exclusive_maximum) : "null") + "}";
 }
 
 std::string NumberSpec::ToString() const {
-  return "NumberSpec{minimum=" + (minimum.has_value() ? std::to_string(*minimum) : "null") +
-         ", maximum=" + (maximum.has_value() ? std::to_string(*maximum) : "null") +
-         ", exclusive_minimum=" +
-         (exclusive_minimum.has_value() ? std::to_string(*exclusive_minimum) : "null") +
-         ", exclusive_maximum=" +
-         (exclusive_maximum.has_value() ? std::to_string(*exclusive_maximum) : "null") + "}";
+  if (!exact_numeric) return "NumberSpec{}";
+  return "NumberSpec{divisor=" + std::to_string(exact_numeric->divisor) +
+         ", scale=" + std::to_string(exact_numeric->scale) +
+         ", minimum=" + exact_numeric->minimum.value_or("null") +
+         ", maximum=" + exact_numeric->maximum.value_or("null") + "}";
 }
 
 std::string StringSpec::ToString() const {
@@ -155,19 +155,202 @@ enum class SchemaErrorType : int {
 
 using SchemaError = TypedError<SchemaErrorType>;
 
-// Unbounded integer multipleOf emits a modulo DFA: states ~= N, transitions ~= 10N.
-// Fail closed above the cap to keep generated grammars bounded.
-constexpr int64_t kIntegerMultipleOfMax = 1024;
-constexpr int64_t kIntegerMultipleOfRangeWidthMax = 10000;
+// The compiler budgets actual automaton work, rather than imposing a semantic
+// restriction on one-sided bounds or a magic maximum schema divisor.
+constexpr size_t kNumericStateBudget = 100000;
+constexpr size_t kNumericTransitionBudget = 1000000;
 
-bool IsMultipleOf(int64_t value, int64_t multiple_of) { return (value % multiple_of) == 0; }
+std::string StripZeros(std::string s) {
+  const size_t first = s.find_first_not_of('0');
+  return first == std::string::npos ? "0" : s.substr(first);
+}
 
-bool HasMultipleInRange(int64_t start, int64_t end, int64_t multiple_of) {
-  for (int64_t value = start; value <= end; ++value) {
-    if (IsMultipleOf(value, multiple_of)) return true;
-    if (value == std::numeric_limits<int64_t>::max()) break;
+int CompareMagnitude(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
+  return a == b ? 0 : (a < b ? -1 : 1);
+}
+
+std::string IncrementMagnitude(std::string s) {
+  for (size_t i = s.size(); i > 0; --i) {
+    if (s[i - 1] != '9') { ++s[i - 1]; return s; }
+    s[i - 1] = '0';
   }
-  return false;
+  return "1" + s;
+}
+
+std::string NegateInteger(const std::string& s) {
+  return s == "0" ? s : (s[0] == '-' ? s.substr(1) : "-" + s);
+}
+
+int CompareInteger(const std::string& a, const std::string& b) {
+  bool an = a[0] == '-', bn = b[0] == '-';
+  if (an != bn) return an ? -1 : 1;
+  int c = CompareMagnitude(an ? a.substr(1) : a, bn ? b.substr(1) : b);
+  return an ? -c : c;
+}
+
+std::string AddOneInteger(const std::string& s) {
+  if (s[0] != '-') return IncrementMagnitude(s);
+  std::string a = s.substr(1);
+  for (size_t i = a.size(); i > 0; --i) {
+    if (a[i - 1] != '0') { --a[i - 1]; break; }
+    a[i - 1] = '9';
+  }
+  a = StripZeros(a);
+  return a == "0" ? a : "-" + a;
+}
+
+struct DecimalParts {
+  bool negative;
+  std::string digits;
+  int scale;
+};
+
+Result<DecimalParts, SchemaError> ExactDecimal(const picojson::value& value) {
+  std::string text;
+  if (!value.number_lexeme().empty()) {
+    text = value.number_lexeme();
+  } else if (value.is<int64_t>()) {
+    text = std::to_string(value.get<int64_t>());
+  } else if (value.is<double>() && std::isfinite(value.get<double>())) {
+    // Programmatically constructed values have no source spelling. Preserve
+    // their shortest round-trip decimal; parsed constraints use the lexeme above.
+    char buffer[64];
+    auto converted = std::to_chars(buffer, buffer + sizeof(buffer), value.get<double>());
+    if (converted.ec != std::errc()) {
+      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Invalid numeric constraint");
+    }
+    text.assign(buffer, converted.ptr);
+  } else {
+    return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Value must be a finite number");
+  }
+  auto resource_error = []() {
+    return ResultErr<SchemaError>(SchemaErrorType::kUnsupportedSchema,
+        "Numeric decimal representation exceeds compiler state budget (100000)");
+  };
+  if (text.size() > kNumericStateBudget) return resource_error();
+  bool negative = text[0] == '-';
+  if (negative) text.erase(0, 1);
+  std::string exponent_text;
+  size_t e = text.find_first_of("eE");
+  if (e != std::string::npos) {
+    exponent_text = text.substr(e + 1);
+    text.resize(e);
+  }
+  int scale = 0;
+  size_t dot = text.find('.');
+  if (dot != std::string::npos) {
+    scale = static_cast<int>(text.size() - dot - 1);
+    text.erase(dot, 1);
+  }
+  text = StripZeros(text);
+  if (text == "0") return ResultOk(DecimalParts{false, "0", 0});
+  int exponent = 0;
+  bool negative_exponent = !exponent_text.empty() && exponent_text[0] == '-';
+  size_t exponent_start = !exponent_text.empty() &&
+      (exponent_text[0] == '-' || exponent_text[0] == '+') ? 1 : 0;
+  for (size_t i = exponent_start; i < exponent_text.size(); ++i) {
+    // Check before multiplication; raw JSON exponents have arbitrary length.
+    if (exponent > static_cast<int>(kNumericStateBudget) / 10) return resource_error();
+    exponent = exponent * 10 + exponent_text[i] - '0';
+    if (exponent > static_cast<int>(kNumericStateBudget)) return resource_error();
+  }
+  if (negative_exponent) exponent = -exponent;
+  scale -= exponent;  // Both terms are bounded above by the compiler budget.
+  if (scale > static_cast<int>(kNumericStateBudget)) return resource_error();
+  if (scale < 0) {
+    if (text.size() + static_cast<size_t>(-scale) > kNumericStateBudget) return resource_error();
+    text.append(-scale, '0');
+    scale = 0;
+  }
+  while (scale > 0 && text.back() == '0') { text.pop_back(); --scale; }
+  if (text.empty() || text == "0") return ResultOk(DecimalParts{false, "0", 0});
+  return ResultOk(DecimalParts{negative, std::move(text), scale});
+}
+
+std::string RoundScaled(const DecimalParts& d, int scale, bool ceil) {
+  std::string whole = d.digits;
+  bool remainder = false;
+  if (d.scale > scale) {
+    size_t removed = static_cast<size_t>(d.scale - scale);
+    size_t kept = whole.size() > removed ? whole.size() - removed : 0;
+    remainder = whole.substr(kept).find_first_not_of('0') != std::string::npos;
+    whole = kept == 0 ? "0" : whole.substr(0, kept);
+  } else {
+    whole.append(scale - d.scale, '0');
+  }
+  if (remainder && (ceil != d.negative)) whole = IncrementMagnitude(whole);
+  whole = StripZeros(whole);
+  return d.negative && whole != "0" ? "-" + whole : whole;
+}
+
+Result<ExactNumericSpec, SchemaError> ParseExactNumeric(
+    const picojson::object& schema, bool integer
+) {
+  ExactNumericSpec spec;
+  if (!integer && !schema.count("multipleOf")) {
+    // Align the endpoint digits exactly. Fraction digits beyond this position
+    // need only distinguish a zero tail from a positive tail; no precision cap
+    // is imposed on generated numbers.
+    for (const auto& key : {"minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"}) {
+      if (!schema.count(key)) continue;
+      auto parsed = ExactDecimal(schema.at(key));
+      if (parsed.IsErr()) return ResultErr(std::move(parsed).UnwrapErr());
+      spec.scale = std::max(spec.scale, std::move(parsed).Unwrap().scale);
+    }
+    spec.variable_fraction = true;
+  }
+  if (schema.count("multipleOf")) {
+    auto parsed = ExactDecimal(schema.at("multipleOf"));
+    if (parsed.IsErr()) return ResultErr(std::move(parsed).UnwrapErr());
+    auto multiple = std::move(parsed).Unwrap();
+    if (multiple.negative || multiple.digits == "0") {
+      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "multipleOf must be greater than 0");
+    }
+    // Any modulus larger than this already needs more states than the entire
+    // work budget. Report a compiler resource error, never ignore the keyword.
+    if (multiple.digits.size() > 6 ||
+        std::stoll(multiple.digits) > static_cast<int64_t>(kNumericStateBudget)) {
+      return ResultErr<SchemaError>(SchemaErrorType::kUnsupportedSchema,
+          "Numeric automaton exceeds compiler state budget (100000)");
+    }
+    spec.divisor = std::stoll(multiple.digits);
+    spec.scale = multiple.scale;
+    if (integer) {
+      // n is a multiple of p/10^s iff p/gcd(p,10^s) divides n.
+      int twos = spec.scale, fives = spec.scale;
+      while (twos > 0 && spec.divisor % 2 == 0) { spec.divisor /= 2; --twos; }
+      while (fives > 0 && spec.divisor % 5 == 0) { spec.divisor /= 5; --fives; }
+      spec.scale = 0;
+    }
+  }
+  for (const auto& key : {"minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum"}) {
+    if (!schema.count(key)) continue;
+    auto parsed = ExactDecimal(schema.at(key));
+    if (parsed.IsErr()) return ResultErr(std::move(parsed).UnwrapErr());
+    auto bound = std::move(parsed).Unwrap();
+    bool lower = key == std::string("minimum") || key == std::string("exclusiveMinimum");
+    bool exclusive = key == std::string("exclusiveMinimum") || key == std::string("exclusiveMaximum");
+    std::string rounded = RoundScaled(bound, spec.scale, lower != exclusive);
+    if (exclusive && !spec.variable_fraction) rounded = lower ? AddOneInteger(rounded) : NegateInteger(AddOneInteger(NegateInteger(rounded)));
+    auto& destination = lower ? spec.minimum : spec.maximum;
+    auto& strict = lower ? spec.exclusive_minimum : spec.exclusive_maximum;
+    if (!destination || (lower ? CompareInteger(rounded, *destination) > 0
+                              : CompareInteger(rounded, *destination) < 0)) {
+      destination = std::move(rounded);
+      strict = spec.variable_fraction && exclusive;
+    } else if (spec.variable_fraction && exclusive && CompareInteger(rounded, *destination) == 0) {
+      strict = true;
+    }
+  }
+  if (spec.minimum && spec.maximum && CompareInteger(*spec.minimum, *spec.maximum) > 0) {
+    return ResultErr<SchemaError>(SchemaErrorType::kUnsatisfiableSchema, "Invalid range: empty range");
+  }
+  if (spec.minimum && spec.maximum && *spec.minimum == *spec.maximum &&
+      (spec.exclusive_minimum || spec.exclusive_maximum)) {
+    return ResultErr<SchemaError>(SchemaErrorType::kUnsatisfiableSchema, "Invalid range: empty range");
+  }
+  return ResultOk(std::move(spec));
 }
 
 constexpr const char* kUnsupportedOneOfMessage =
@@ -250,14 +433,9 @@ bool IsNumericValue(const picojson::value& value) {
 }
 
 bool IsIntegerValue(const picojson::value& value) {
-  if (value.is<int64_t>()) {
-    return true;
-  }
-  if (!value.is<double>()) {
-    return false;
-  }
-  double number = value.get<double>();
-  return std::isfinite(number) && std::floor(number) == number;
+  if (!IsNumericValue(value)) return false;
+  auto decimal = ExactDecimal(value);
+  return decimal.IsOk() && std::move(decimal).Unwrap().scale == 0;
 }
 
 bool JSONValuesMayOverlap(const picojson::value& lhs, const picojson::value& rhs) {
@@ -339,23 +517,6 @@ bool ValueMatchesType(const picojson::value& value, const std::string& type) {
     return value.is<picojson::object>();
   }
   return false;
-}
-
-bool IsRangeWidthOverCap(int64_t start, int64_t end, int64_t cap) {
-  uint64_t cap_u = static_cast<uint64_t>(cap);
-  if (start <= 0 && end >= 0) {
-    // Count [start, end] inclusively without evaluating -INT64_MIN or overflowing the sum.
-    uint64_t negative_count = start < 0 ? static_cast<uint64_t>(-(start + 1)) + 1 : 0;
-    if (negative_count > cap_u) return true;
-    uint64_t remaining = cap_u - negative_count;
-    if (remaining == 0) return true;
-    --remaining;  // zero
-    uint64_t positive_count = end > 0 ? static_cast<uint64_t>(end) : 0;
-    return positive_count > remaining;
-  }
-
-  uint64_t value_count = static_cast<uint64_t>(end - start) + 1;
-  return value_count > cap_u;
 }
 
 // Effective inclusive integer range after folding exclusive bounds into minimum/maximum. A nullopt
@@ -905,211 +1066,27 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
 
 Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::object& schema) {
   IntegerSpec spec;
-
-  auto checkAndConvertIntegerBound = [](const picojson::value& value
-                                     ) -> Result<int64_t, SchemaError> {
-    if (!value.is<int64_t>() && !value.is<double>()) {
-      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Value must be a number");
-    }
-    if (value.is<int64_t>()) return ResultOk<int64_t>(value.get<int64_t>());
-    double val = value.get<double>();
-    if (val != std::floor(val)) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "Integer constraint must be a whole number"
-      );
-    }
-    static const double PROBLEMATIC_MIN = -9223372036854776000.0;
-    static const double PROBLEMATIC_MAX = 9223372036854776000.0;
-    if (val == PROBLEMATIC_MIN) {
-      XGRAMMAR_CHECK(false
-      ) << "Integer exceeds minimum limit due to precision loss at 64-bit boundary";
-    }
-
-    if (val == PROBLEMATIC_MAX) {
-      XGRAMMAR_CHECK(false
-      ) << "Integer exceeds maximum limit due to precision loss at 64-bit boundary";
-    }
-    static const double MAX_INT64_AS_DOUBLE =
-        static_cast<double>(std::numeric_limits<int64_t>::max());
-    static const double MIN_INT64_AS_DOUBLE =
-        static_cast<double>(std::numeric_limits<int64_t>::min());
-    XGRAMMAR_CHECK(val <= MAX_INT64_AS_DOUBLE) << "Integer exceeds maximum limit";
-    XGRAMMAR_CHECK(val >= MIN_INT64_AS_DOUBLE) << "Integer exceeds minimum limit";
-    return ResultOk<int64_t>(static_cast<int64_t>(val));
-  };
-
-  auto checkAndConvertMultipleOf = [](const picojson::value& value
-                                   ) -> Result<int64_t, SchemaError> {
-    double val;
-    if (value.is<int64_t>()) {
-      val = static_cast<double>(value.get<int64_t>());
-    } else if (value.is<double>()) {
-      val = value.get<double>();
-    } else {
-      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Value must be a number");
-    }
-    if (val <= 0) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "multipleOf must be greater than 0"
-      );
-    }
-    if (val != std::floor(val)) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsupportedSchema, "multipleOf for type:integer must be an integer"
-      );
-    }
-    if (val > static_cast<double>(kIntegerMultipleOfMax)) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsupportedSchema,
-          "multipleOf for type:integer must be > 0 and <= " + std::to_string(kIntegerMultipleOfMax)
-      );
-    }
-    return ResultOk<int64_t>(static_cast<int64_t>(val));
-  };
-
-  if (schema.count("multipleOf")) {
-    auto result = checkAndConvertMultipleOf(schema.at("multipleOf"));
-    if (result.IsErr()) {
-      if (result.ErrRef().Type() != SchemaErrorType::kUnsupportedSchema) {
-        return ResultErr(std::move(result).UnwrapErr());
-      }
-      XGRAMMAR_LOG(WARNING) << result.ErrRef().what() << "; ignoring multipleOf";
-    } else {
-      spec.multiple_of = std::move(result).Unwrap();
-    }
-  }
-  if (schema.count("minimum")) {
-    auto result = checkAndConvertIntegerBound(schema.at("minimum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.minimum = std::move(result).Unwrap();
-  }
-  if (schema.count("maximum")) {
-    auto result = checkAndConvertIntegerBound(schema.at("maximum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.maximum = std::move(result).Unwrap();
-  }
-  if (schema.count("exclusiveMinimum")) {
-    auto result = checkAndConvertIntegerBound(schema.at("exclusiveMinimum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    int64_t val = std::move(result).Unwrap();
-    if (val == std::numeric_limits<int64_t>::max()) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsatisfiableSchema, "exclusiveMinimum would cause integer overflow"
-      );
-    }
-    spec.exclusive_minimum = val;
-  }
-  if (schema.count("exclusiveMaximum")) {
-    auto result = checkAndConvertIntegerBound(schema.at("exclusiveMaximum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    int64_t val = std::move(result).Unwrap();
-    if (val == std::numeric_limits<int64_t>::min()) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsatisfiableSchema, "exclusiveMaximum would cause integer underflow"
-      );
-    }
-    spec.exclusive_maximum = val;
+  if (schema.count("multipleOf") || schema.count("minimum") || schema.count("maximum") ||
+      schema.count("exclusiveMinimum") || schema.count("exclusiveMaximum")) {
+    auto exact = ParseExactNumeric(schema, true);
+    if (exact.IsErr()) return ResultErr(std::move(exact).UnwrapErr());
+    spec.exact_numeric = std::move(exact).Unwrap();
+    return ResultOk(std::move(spec));
   }
 
-  EffectiveIntegerRange effective_range = ComputeEffectiveIntegerRange(spec);
-  int64_t effective_min = effective_range.start.value_or(std::numeric_limits<int64_t>::min());
-  int64_t effective_max = effective_range.end.value_or(std::numeric_limits<int64_t>::max());
-  if (effective_min > effective_max) {
-    return ResultErr<SchemaError>(
-        SchemaErrorType::kUnsatisfiableSchema, "Invalid range: minimum greater than maximum"
-    );
-  }
-  if (spec.multiple_of.has_value()) {
-    bool has_lower_bound = spec.minimum.has_value() || spec.exclusive_minimum.has_value();
-    bool has_upper_bound = spec.maximum.has_value() || spec.exclusive_maximum.has_value();
-    if (has_lower_bound || has_upper_bound) {
-      if (!has_lower_bound || !has_upper_bound ||
-          IsRangeWidthOverCap(effective_min, effective_max, kIntegerMultipleOfRangeWidthMax)) {
-        XGRAMMAR_LOG(WARNING
-        ) << "range + multipleOf combination not yet supported; ignoring multipleOf";
-        spec.multiple_of.reset();
-        return ResultOk(std::move(spec));
-      }
-      if (!HasMultipleInRange(effective_min, effective_max, *spec.multiple_of)) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kUnsatisfiableSchema, "range contains no multipleOf value"
-        );
-      }
-    }
-  }
   return ResultOk(std::move(spec));
 }
 
 Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object& schema) {
-  if (schema.count("multipleOf")) {
-    const auto& value = schema.at("multipleOf");
-    if (!value.is<int64_t>() && !value.is<double>()) {
-      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Value must be a number");
-    }
-    double multiple_of =
-        value.is<int64_t>() ? static_cast<double>(value.get<int64_t>()) : value.get<double>();
-    if (multiple_of <= 0) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "multipleOf must be greater than 0"
-      );
-    }
-    XGRAMMAR_LOG(WARNING) << "multipleOf is not supported for type:number; ignoring multipleOf";
+  if (schema.count("multipleOf") || schema.count("minimum") || schema.count("maximum") ||
+      schema.count("exclusiveMinimum") || schema.count("exclusiveMaximum")) {
+    auto exact = ParseExactNumeric(schema, false);
+    if (exact.IsErr()) return ResultErr(std::move(exact).UnwrapErr());
+    NumberSpec spec;
+    spec.exact_numeric = std::move(exact).Unwrap();
+    return ResultOk(std::move(spec));
   }
   NumberSpec spec;
-
-  auto getDouble = [](const picojson::value& value) -> Result<double, SchemaError> {
-    if (!value.is<double>() && !value.is<int64_t>()) {
-      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Value must be a number");
-    }
-    return ResultOk<double>(value.get<double>());
-  };
-
-  if (schema.count("minimum")) {
-    auto result = getDouble(schema.at("minimum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.minimum = std::move(result).Unwrap();
-  }
-  if (schema.count("maximum")) {
-    auto result = getDouble(schema.at("maximum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.maximum = std::move(result).Unwrap();
-  }
-  if (schema.count("exclusiveMinimum")) {
-    auto result = getDouble(schema.at("exclusiveMinimum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.exclusive_minimum = std::move(result).Unwrap();
-  }
-  if (schema.count("exclusiveMaximum")) {
-    auto result = getDouble(schema.at("exclusiveMaximum"));
-    if (result.IsErr()) return ResultErr(std::move(result).UnwrapErr());
-    spec.exclusive_maximum = std::move(result).Unwrap();
-  }
-
-  // The range is empty if any lower bound conflicts with any upper bound. An
-  // exclusive bound also rules out equality, so it uses ">=" instead of ">".
-  auto empty = []() {
-    return ResultErr<SchemaError>(
-        SchemaErrorType::kUnsatisfiableSchema, "Invalid range: empty range"
-    );
-  };
-
-  // minimum (x >= min) vs maximum (x <= max).
-  if (spec.minimum && spec.maximum && *spec.minimum > *spec.maximum) {
-    return empty();
-  }
-  // minimum (x >= min) vs exclusiveMaximum (x < exclMax).
-  if (spec.minimum && spec.exclusive_maximum && *spec.minimum >= *spec.exclusive_maximum) {
-    return empty();
-  }
-  // exclusiveMinimum (x > exclMin) vs maximum (x <= max).
-  if (spec.exclusive_minimum && spec.maximum && *spec.exclusive_minimum >= *spec.maximum) {
-    return empty();
-  }
-  // exclusiveMinimum (x > exclMin) vs exclusiveMaximum (x < exclMax).
-  if (spec.exclusive_minimum && spec.exclusive_maximum &&
-      *spec.exclusive_minimum >= *spec.exclusive_maximum) {
-    return empty();
-  }
   return ResultOk(std::move(spec));
 }
 
@@ -2525,32 +2502,183 @@ int32_t JSONSchemaConverter::ExcludingString(
   return RuleRef(rules[fsm.GetStart()]);
 }
 
+int32_t JSONSchemaConverter::GenerateExactNumeric(
+    const ExactNumericSpec& spec, const std::string& rule_name
+) {
+  // Each accepted path is a decimal integer divisible by divisor, with the
+  // decimal point placed scale digits from its end. Bounds operate on that same
+  // integer lattice. No sampling, approximate modulo, or post-validation occurs.
+  using State = std::tuple<int64_t, int, int, int, int>;
+  struct Node {
+    State state;
+    std::vector<std::pair<char, size_t>> edges;
+    bool terminal = false;
+  };
+  std::vector<int32_t> branches;
+  size_t total_states = 0, total_transitions = 0;
+  for (bool negative : {false, true}) {
+    std::string low = negative && !spec.variable_fraction ? "1" : "0";
+    bool strict_low = negative && spec.variable_fraction;
+    bool strict_high = false;
+    std::optional<std::string> high;
+    if (!negative) {
+      if (spec.minimum && CompareInteger(*spec.minimum, low) >= 0) {
+        low = *spec.minimum;
+        strict_low = spec.exclusive_minimum;
+      }
+      high = spec.maximum;
+      strict_high = spec.exclusive_maximum;
+    } else {
+      if (spec.maximum) {
+        std::string candidate = NegateInteger(*spec.maximum);
+        if (CompareInteger(candidate, low) > 0) {
+          low = std::move(candidate);
+          strict_low = spec.exclusive_maximum;
+        }
+      }
+      if (spec.minimum) high = NegateInteger(*spec.minimum);
+      strict_high = spec.exclusive_minimum;
+    }
+    if (high && CompareInteger(*high, low) < 0) continue;
+    std::optional<std::string> lower = low == "0" && !strict_low ? std::nullopt : std::optional<std::string>(low);
+    int max_length = static_cast<int>(std::max(lower ? lower->size() : 0, high ? high->size() : 0));
+    auto step = [&](State state, int digit) {
+      auto [remainder, length, lc, hc, phase] = state;
+      remainder = (remainder * 10 + digit) % spec.divisor;
+      // Leading zeros in fractional values carry no magnitude digits.
+      if (length != 0 || digit != 0) {
+        if (lower && lc == 0 && length < static_cast<int>(lower->size())) {
+          int b = (*lower)[length] - '0';
+          lc = digit == b ? 0 : (digit < b ? -1 : 1);
+        }
+        if (high && hc == 0 && length < static_cast<int>(high->size())) {
+          int b = (*high)[length] - '0';
+          hc = digit == b ? 0 : (digit < b ? -1 : 1);
+        }
+        if (max_length > 0) length = std::min(length + 1, max_length + 1);
+      }
+      return State{remainder, length, lc, hc, phase};
+    };
+    auto compare_bound = [](int length, int comparison, const std::string& bound) {
+      // Normalized zero has length zero; its canonical bound string is "0".
+      int bound_length = bound == "0" ? 0 : static_cast<int>(bound.size());
+      return length == bound_length ? comparison : (length < bound_length ? -1 : 1);
+    };
+    auto accepts = [&](State state) {
+      auto [remainder, length, lc, hc, phase] = state;
+      bool positive_tail = phase == -5;
+      int padding = phase == -5 ? 0 : (phase < 0 ? spec.scale : phase);
+      for (int i = 0; i < padding; ++i) state = step(state, 0);
+      std::tie(remainder, length, lc, hc, phase) = state;
+      int lower_comparison = lower ? compare_bound(length, lc, *lower) : 1;
+      int upper_comparison = high ? compare_bound(length, hc, *high) : -1;
+      return remainder == 0 &&
+             (lower_comparison > 0 || (lower_comparison == 0 && (!strict_low || positive_tail))) &&
+             (upper_comparison < 0 || (upper_comparison == 0 && !strict_high && !positive_tail));
+    };
+    std::map<State, size_t> ids;
+    std::vector<Node> nodes;
+    auto add = [&](State state) {
+      auto found = ids.find(state);
+      if (found != ids.end()) return found->second;
+      if (++total_states > kNumericStateBudget) throw SchemaError(
+          SchemaErrorType::kUnsupportedSchema, "Numeric automaton exceeds compiler state budget (100000)");
+      size_t id = nodes.size();
+      ids.emplace(state, id);
+      int phase = std::get<4>(state);
+      nodes.push_back(Node{state, {}, phase != -3 && phase != -4 && accepts(state)});
+      return id;
+    };
+    // phase -3 is the start, -4 requires the first fractional digit,
+    // -2 is the integer zero, -1 a nonzero integer;
+    // phase >= 0 counts the remaining endpoint fraction digits. In variable
+    // fraction mode, -5 means the extra fraction tail contains a nonzero digit.
+    size_t initial = add(State{0, 0, 0, 0, -3});
+    nodes[initial].terminal = false;
+    for (size_t id = 0; id < nodes.size(); ++id) {
+      State state = nodes[id].state;
+      auto [remainder, length, lc, hc, phase] = state;
+      std::vector<std::pair<char, State>> transitions;
+      bool tail = spec.variable_fraction &&
+                  (phase == 0 || phase == -5 || (phase == -4 && spec.scale == 0));
+      if (tail) {
+        for (int digit = 0; digit <= 9; ++digit) {
+          State next = state;
+          std::get<4>(next) = phase == -5 || digit != 0 ? -5 : 0;
+          transitions.emplace_back(static_cast<char>('0' + digit), next);
+        }
+      } else if (phase == -3 || phase == -4 || phase == -1 || phase > 0) {
+        for (int digit = 0; digit <= 9; ++digit) {
+          State next = step(state, digit);
+          std::get<4>(next) = phase == -3 ? (digit == 0 ? -2 : -1) :
+                             phase == -4 ? spec.scale - 1 :
+                             (phase > 0 ? phase - 1 : phase);
+          // Once the normalized prefix exceeds the upper bound's digit count,
+          // appending more digits can never enter its interval.
+          if (high && std::get<1>(next) > static_cast<int>(high->size())) continue;
+          transitions.emplace_back(static_cast<char>('0' + digit), next);
+        }
+      }
+      if ((phase == -1 || phase == -2) && (spec.scale > 0 || spec.variable_fraction)) {
+        State fraction = state;
+        std::get<4>(fraction) = -4;
+        transitions.emplace_back('.', fraction);
+      }
+      std::vector<std::pair<char, size_t>> edges;
+      for (auto& [character, next] : transitions) {
+        if (++total_transitions > kNumericTransitionBudget) throw SchemaError(
+            SchemaErrorType::kUnsupportedSchema, "Numeric automaton exceeds compiler transition budget (1000000)");
+        edges.emplace_back(character, add(next));
+      }
+      nodes[id].edges = std::move(edges);
+    }
+    // Remove nonproductive states before passing the graph to the normal
+    // grammar compiler. This also diagnoses bounded intervals with no multiple.
+    std::vector<std::vector<size_t>> predecessors(nodes.size());
+    std::vector<bool> productive(nodes.size(), false);
+    std::queue<size_t> pending;
+    for (size_t id = 0; id < nodes.size(); ++id) {
+      if (nodes[id].terminal) { productive[id] = true; pending.push(id); }
+      for (auto [character, next] : nodes[id].edges) predecessors[next].push_back(id);
+    }
+    while (!pending.empty()) {
+      size_t id = pending.front(); pending.pop();
+      for (size_t previous : predecessors[id]) {
+        if (!productive[previous]) { productive[previous] = true; pending.push(previous); }
+      }
+    }
+    if (!productive[initial]) continue;
+    std::vector<int32_t> rules(nodes.size());
+    for (size_t id = 0; id < nodes.size(); ++id) {
+      if (productive[id]) rules[id] = builder_.AddEmptyRuleWithHint(
+          rule_name + (negative ? "_negative_" : "_positive_") + std::to_string(id));
+    }
+    for (size_t id = 0; id < nodes.size(); ++id) {
+      if (!productive[id]) continue;
+      std::vector<int32_t> choices;
+      if (nodes[id].terminal) choices.push_back(Empty());
+      for (auto [character, next] : nodes[id].edges) {
+        if (productive[next]) choices.push_back(Sequence({ByteString(std::string(1, character)), RuleRef(rules[next])}));
+      }
+      builder_.UpdateRuleBody(rules[id], Choice(choices));
+    }
+    int32_t body = RuleRef(rules[initial]);
+    branches.push_back(negative ? Sequence({ByteString("-"), body}) : body);
+  }
+  XGRAMMAR_CHECK(!branches.empty()) << "Unsatisfiable numeric schema: range contains no multipleOf value";
+  return Choice(branches);
+}
+
 int32_t JSONSchemaConverter::GenerateInteger(
     const IntegerSpec& spec, const std::string& rule_name
 ) {
+  if (spec.exact_numeric) return GenerateExactNumeric(*spec.exact_numeric, rule_name);
   // Shared with ParseInteger's range validation so emission and validation agree on the effective
   // range; a nullopt side means that side is unbounded.
   const EffectiveIntegerRange range = ComputeEffectiveIntegerRange(spec);
   std::optional<int64_t> start = range.start;
   std::optional<int64_t> end = range.end;
 
-  if (spec.multiple_of.has_value()) {
-    // ParseInteger keeps multiple_of only when the range is fully bounded (enumerate the
-    // multiples) or fully unbounded (emit a modulo DFA); the half-bounded case is dropped there.
-    if (start.has_value() && end.has_value()) {
-      std::vector<int32_t> multiples;
-      for (int64_t value = *start; value <= *end; ++value) {
-        if (IsMultipleOf(value, *spec.multiple_of)) {
-          multiples.push_back(ByteString(std::to_string(value)));
-        }
-        if (value == std::numeric_limits<int64_t>::max()) {
-          break;
-        }
-      }
-      return Choice(multiples);
-    }
-    return GenerateIntegerMultipleOfDFA(*spec.multiple_of, rule_name);
-  }
   if (start.has_value() || end.has_value()) {
     return RegexExpression(
         GenerateRangeRegex(start, end),
@@ -2569,64 +2697,8 @@ int32_t JSONSchemaConverter::GenerateInteger(
   );
 }
 
-int32_t JSONSchemaConverter::GenerateIntegerMultipleOfDFA(
-    int64_t multiple_of, const std::string& rule_name
-) {
-  std::vector<int32_t> states(multiple_of);
-  for (int64_t state = 0; state < multiple_of; ++state) {
-    states[state] = builder_.AddEmptyRuleWithHint(
-        rule_name + "_multiple_of_" + std::to_string(multiple_of) + "_mod_" + std::to_string(state)
-    );
-  }
-  for (int64_t state = 0; state < multiple_of; ++state) {
-    std::vector<int32_t> transitions;
-    if (state == 0) {
-      transitions.push_back(Empty());
-    }
-    for (int64_t digit = 0; digit <= 9; ++digit) {
-      int64_t next_state = (state * 10 + digit) % multiple_of;
-      transitions.push_back(
-          Sequence({ByteString(std::to_string(digit)), RuleRef(states[next_state])})
-      );
-    }
-    builder_.UpdateRuleBody(states[state], Choice(transitions));
-  }
-
-  std::vector<int32_t> non_zero_starts;
-  for (int64_t digit = 1; digit <= 9; ++digit) {
-    non_zero_starts.push_back(
-        Sequence({ByteString(std::to_string(digit)), RuleRef(states[digit % multiple_of])})
-    );
-  }
-  return Choice(
-      {ByteString("0"), Sequence({Choice({Empty(), ByteString("-")}), Choice(non_zero_starts)})}
-  );
-}
-
 int32_t JSONSchemaConverter::GenerateNumber(const NumberSpec& spec, const std::string& rule_name) {
-  std::optional<double> start = spec.minimum;
-  std::optional<double> end = spec.maximum;
-  bool exclusive_start = false;
-  bool exclusive_end = false;
-  // When both bounds are present the larger lower bound wins; on a tie the
-  // exclusive one is stricter.
-  if (spec.exclusive_minimum.has_value() &&
-      (!start.has_value() || *spec.exclusive_minimum >= *start)) {
-    start = spec.exclusive_minimum;
-    exclusive_start = true;
-  }
-  if (spec.exclusive_maximum.has_value() && (!end.has_value() || *spec.exclusive_maximum <= *end)) {
-    end = spec.exclusive_maximum;
-    exclusive_end = true;
-  }
-  if (start.has_value() || end.has_value()) {
-    return RegexExpression(
-        GenerateFloatRangeRegex(start, end, /*precision=*/6, exclusive_start, exclusive_end),
-        false,
-        /*force_cfg_expansion=*/true
-    );
-  }
-
+  if (spec.exact_numeric) return GenerateExactNumeric(*spec.exact_numeric, rule_name);
   int32_t optional_minus = Choice({Empty(), ByteString("-")});
   int32_t integer_part = Choice(
       {ByteString("0"),

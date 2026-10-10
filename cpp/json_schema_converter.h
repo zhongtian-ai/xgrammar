@@ -33,21 +33,30 @@ struct SchemaSpec;
 using SchemaSpecPtr = std::shared_ptr<SchemaSpec>;
 
 // Basic Type Specs
+// A decimal multiple has a finite fixed-point representation. Bounds are exact,
+// signed integers in units of 10^-scale; emission never uses floating-point modulo.
+struct ExactNumericSpec {
+  int64_t divisor = 1;
+  int scale = 0;
+  std::optional<std::string> minimum;
+  std::optional<std::string> maximum;
+  bool variable_fraction = false;
+  bool exclusive_minimum = false;
+  bool exclusive_maximum = false;
+};
+
 struct IntegerSpec {
   std::optional<int64_t> minimum;
   std::optional<int64_t> maximum;
   std::optional<int64_t> exclusive_minimum;
   std::optional<int64_t> exclusive_maximum;
-  std::optional<int64_t> multiple_of;
+  std::optional<ExactNumericSpec> exact_numeric;
 
   std::string ToString() const;
 };
 
 struct NumberSpec {
-  std::optional<double> minimum;
-  std::optional<double> maximum;
-  std::optional<double> exclusive_minimum;
-  std::optional<double> exclusive_maximum;
+  std::optional<ExactNumericSpec> exact_numeric;
 
   std::string ToString() const;
 };
@@ -531,7 +540,7 @@ class JSONSchemaConverter {
 
   // Helper for integer/number range regex generation
   static std::string GenerateRangeRegex(std::optional<int64_t> start, std::optional<int64_t> end);
-  int32_t GenerateIntegerMultipleOfDFA(int64_t multiple_of, const std::string& rule_name);
+  int32_t GenerateExactNumeric(const ExactNumericSpec& spec, const std::string& rule_name);
   static std::string GenerateFloatRangeRegex(
       std::optional<double> start,
       std::optional<double> end,
