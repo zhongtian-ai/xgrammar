@@ -47,6 +47,7 @@ class DepthGuardedParseContext {
     *out_ = picojson::value(f);
     return true;
   }
+  void set_number_lexeme(const std::string& text) { out_->set_number_lexeme(text); }
   template <typename Iter>
   bool parse_string(picojson::input<Iter>& in) {
     *out_ = picojson::value(picojson::string_type, false);

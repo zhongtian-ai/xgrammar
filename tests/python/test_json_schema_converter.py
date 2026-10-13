@@ -351,51 +351,42 @@ def test_integer_multiple_of(
 
 
 @pytest.mark.parametrize(
-    "schema, warning_message, accepted_instances, rejected_instances",
+    "schema, accepted_instances, rejected_instances",
     [
         (
             {"type": "number", "multipleOf": 2},
-            "multipleOf is not supported for type:number; ignoring multipleOf",
+            [0, 2, -4],
             [3, 5.5],
-            [],
         ),
         (
             {"type": "integer", "multipleOf": 2.5},
-            "multipleOf for type:integer must be an integer; ignoring multipleOf",
-            [2, 3],
-            [1.5],
+            [0, 5, -10],
+            [2, 3, 1.5],
         ),
         (
             {"type": "integer", "multipleOf": 1025},
-            "multipleOf for type:integer must be > 0 and <= 1024; ignoring multipleOf",
-            [1025, 1026],
-            [],
-        ),
-        (
-            {"type": "integer", "multipleOf": 1e30},
-            "multipleOf for type:integer must be > 0 and <= 1024; ignoring multipleOf",
-            [1, 2],
-            [],
+            [0, 1025, 2050],
+            [1026, 1, -1],
         ),
         (
             {"type": "integer", "minimum": 0, "multipleOf": 2},
-            "range + multipleOf combination not yet supported; ignoring multipleOf",
-            [1, 3],
-            [-1],
+            [0, 2, 4],
+            [1, 3, -1],
+        ),
+        (
+            {"type": "number", "minimum": -0.3, "maximum": 0.3, "multipleOf": 0.1},
+            [0, 0.1, 0.2, 0.3, -0.3],
+            [0.05, 0.31, -0.4],
         ),
     ],
 )
-def test_multiple_of_unsupported_warns_and_ignores(
-    capfd,
+def test_multiple_of_exact_constraints(
     schema: Dict[str, Any],
-    warning_message: str,
     accepted_instances: List[Union[int, float]],
     rejected_instances: List[Union[int, float]],
 ):
     for instance in accepted_instances:
         check_schema_with_instance(schema, instance)
-    captured = capfd.readouterr()
-    assert warning_message in captured.err
     for instance in rejected_instances:
         check_schema_with_instance(schema, instance, is_accepted=False)
 
@@ -403,11 +394,12 @@ def test_multiple_of_unsupported_warns_and_ignores(
 @pytest.mark.parametrize(
     "schema, err_message",
     [
-        ({"type": "integer", "multipleOf": "x"}, "Value must be a number"),
+        ({"type": "integer", "multipleOf": "x"}, "Value must be a finite number"),
         ({"type": "integer", "multipleOf": 0}, "multipleOf must be greater than 0"),
         ({"type": "integer", "multipleOf": -2}, "multipleOf must be greater than 0"),
-        ({"type": "number", "multipleOf": "x"}, "Value must be a number"),
+        ({"type": "number", "multipleOf": "x"}, "Value must be a finite number"),
         ({"type": "number", "multipleOf": 0}, "multipleOf must be greater than 0"),
+        ({"type": "integer", "multipleOf": 1e30}, "compiler state budget"),
         (
             {"type": "integer", "minimum": 5, "maximum": 6, "multipleOf": 7},
             "range contains no multipleOf value",
